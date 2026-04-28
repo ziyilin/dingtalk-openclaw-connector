@@ -49,6 +49,7 @@ import {
   emptyGroupReplyLogHint,
   groupChatLacksVisibleRepliesAutomatic,
 } from "./utils/empty-reply.ts";
+import { registerCardSession } from "./services/card-session-registry.ts";
 
 
 export type CreateDingtalkReplyDispatcherParams = {
@@ -64,6 +65,8 @@ export type CreateDingtalkReplyDispatcherParams = {
   asyncMode?: boolean;
   /** 队列繁忙时预先创建的 AI Card，startStreaming 时直接复用而非新建 */
   preCreatedCard?: AICardInstance;
+  /** OpenClaw session key，用于卡片反馈追溯到 session */
+  sessionKey?: string;
 };
 
 export function createDingtalkReplyDispatcher(params: CreateDingtalkReplyDispatcherParams) {
@@ -94,6 +97,8 @@ export function createDingtalkReplyDispatcher(params: CreateDingtalkReplyDispatc
   // AI Card 状态管理
   let currentCardTarget: AICardTarget | null = null;
   let accumulatedText = "";
+  // 标记 preCreatedCard 是否已被使用，防止后续 turn 重复复用已完成的卡片
+  let preCreatedCardConsumed = false;
   const deliveredFinalTexts = new Set<string>();
 
   /** 本轮是否已向用户发出过可见回复（final / 流式更新 / 错误兜底等） */
@@ -310,13 +315,20 @@ export function createDingtalkReplyDispatcher(params: CreateDingtalkReplyDispatc
 
       // 若队列繁忙时已预先创建了 Card（显示排队 ACK 文案），直接复用，无需新建
       // 这样用户看到的是同一条消息从 ACK 文案更新为最终结果，而不是多出一条消息
-      if (preCreatedCard) {
+      // ⚠️ 只复用一次：closeStreaming 后再次进入 startStreaming 时不能重复复用已完成的卡片
+      if (preCreatedCard && !preCreatedCardConsumed) {
+        preCreatedCardConsumed = true;
         log.info(`[DingTalk][startStreaming] 复用预创建 AI Card，cardInstanceId=${preCreatedCard.cardInstanceId}`);
         currentCardTarget = preCreatedCard as any;
         accumulatedText = "";
         outboundUserVisibleThisTurn = true;
         watchdogCard = preCreatedCard;
         armCardWatchdog();
+        // 注册 card → session 映射，供卡片回调追溯反馈
+        if (params.sessionKey) {
+          registerCardSession(preCreatedCard.cardInstanceId, { sessionKey: params.sessionKey, agentId, createdAt: Date.now() });
+          log.warn(`[DingTalk][CardSession] 已注册预创建卡片映射: cardInstanceId=${preCreatedCard.cardInstanceId}, sessionKey=${params.sessionKey}`);
+        }
         return;
       }
 
@@ -332,7 +344,7 @@ export function createDingtalkReplyDispatcher(params: CreateDingtalkReplyDispatc
         const card = await createAICardForTarget(
           account.config as DingtalkConfig,
           target,
-          log
+          log,
         );
         currentCardTarget = card as any;
         accumulatedText = "";
@@ -341,6 +353,11 @@ export function createDingtalkReplyDispatcher(params: CreateDingtalkReplyDispatc
           watchdogCard = card;
           armCardWatchdog();
           log.info(`[DingTalk][startStreaming] ✅ AI Card 创建成功`);
+          // 注册 card → session 映射，供卡片回调追溯反馈
+          if (params.sessionKey) {
+            registerCardSession(card.cardInstanceId, { sessionKey: params.sessionKey, agentId, createdAt: Date.now() });
+            log.warn(`[DingTalk][CardSession] 已注册新建卡片映射: cardInstanceId=${card.cardInstanceId}, sessionKey=${params.sessionKey}`);
+          }
         } else {
           log.warn(`[DingTalk][startStreaming] AI Card 创建返回 null，静默降级到普通消息模式`);
         }
@@ -348,7 +365,11 @@ export function createDingtalkReplyDispatcher(params: CreateDingtalkReplyDispatc
         log.error(`[DingTalk][startStreaming] ❌ AI Card 创建失败：${error?.message || String(error)}，静默降级到普通消息模式`);
         currentCardTarget = null;
       }
-    })();
+    })().finally(() => {
+      // ✅ 确保所有路径（preCreatedCard / 新建 / 异常 / asyncMode / streamingDisabled）都清空 promise，
+      // 允许后续 turn 的 startStreaming 重新创建卡片
+      cardCreationPromise = null;
+    });
 
     cardCreationPromise = creation;
     // 在 Promise settle 后清空 gate，覆盖所有路径（含 asyncMode /
