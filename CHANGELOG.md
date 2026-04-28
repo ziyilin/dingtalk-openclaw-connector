@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.20] - 2026-04-28
+
+### 新增 / Added
+- ✨ **AI Card 卡片反馈回调** — 支持自定义 AI Card 模板的点赞/点踩反馈，通过 TOPIC_CARD Stream 回调接收用户反馈事件并更新卡片变量
+  **AI Card Feedback Callback** — Support like/dislike feedback for custom AI Card templates via TOPIC_CARD Stream callback
+- ✨ **卡片回调配置化** — 新增 `cardLikeActionId`、`cardDislikeActionId`、`cardLikeVar` 三个可选配置项，支持不同卡片模板自定义回调 action ID 和变量名
+  **Configurable card callback** — Added `cardLikeActionId`, `cardDislikeActionId`, `cardLikeVar` optional config fields for custom card templates
+
 ## [0.8.19] - 2026-04-25
 
 ### 新增 / Added
