@@ -18,7 +18,6 @@ import type { ResolvedDingtalkAccount } from "../types/index.ts";
 import {
   checkAndMarkDingtalkMessage,
 } from "../utils/utils-legacy.ts";
-import { recordFeedbackToSession } from "../services/card-session-registry.ts";
 
 // ============ 类型定义 ============
 
@@ -59,7 +58,7 @@ export type MonitorDingtalkAccountOpts = {
 /** 心跳间隔（毫秒） */
 const HEARTBEAT_INTERVAL = 10 * 1000; // 10 秒
 /** 超时阈值（毫秒） */
-const TIMEOUT_THRESHOLD = 20 * 1000; // 20 秒（2 次心跳未响应）
+const TIMEOUT_THRESHOLD = 90 * 1000; // 90 秒（9 次心跳未响应）
 /** 基础退避时间（毫秒） */
 const BASE_BACKOFF_DELAY = 1000; // 1 秒
 /** 最大退避时间（毫秒） */
@@ -234,6 +233,13 @@ export async function monitorSingleAccount(
     }
 
     try {
+      // 0. 清理旧 socket 上的自定义监听器，防止旧 close 事件干扰新连接
+      if (client.socket) {
+        client.socket.removeAllListeners('pong');
+        client.socket.removeAllListeners('close');
+        client.socket.removeAllListeners('message');
+      }
+
       // 1. 先断开旧连接（检查 WebSocket 状态）
       if (client.socket?.readyState === 1 || client.socket?.readyState === 3) {
         await client.disconnect();
@@ -284,6 +290,11 @@ export async function monitorSingleAccount(
       lastSocketAvailableTime = Date.now();
       connectionEstablishedTime = Date.now(); // 重置连接建立时间
       reconnectAttempts = 0; // 重连成功，重置计数
+
+      // 5. 重新注册事件监听器（新 socket 需要重新绑定）
+      setupPongListener();
+      setupMessageListener();
+      setupCloseListener();
 
       // 重连成功，向框架报告 connected: true
       onStatusChange?.({ connected: true, lastConnectedAt: Date.now() });
@@ -450,10 +461,7 @@ export async function monitorSingleAccount(
     logger.debug(`Connection 已停止`);
   }
 
-  // 初始化：设置所有事件监听器
-  setupPongListener();
-  setupMessageListener();
-  setupCloseListener();
+  // 注意：事件监听器在 client.connect() 成功后注册，见下方连接逻辑
 
   return new Promise<void>(async (resolve, reject) => {
     // Handle abort signal
@@ -687,10 +695,6 @@ export async function monitorSingleAccount(
           if (actionIds.includes(likeActionId)) {
             logger.info(`[DingTalk][CardCallback] 👍 用户 ${userId} 点赞了 ${outTrackId}`);
             response.cardData.cardParamMap[likeVar] = 1;
-            // 将点赞反馈记录到 session
-            recordFeedbackToSession({ outTrackId, like: 1, userId, logger }).catch(err => {
-              logger.warn(`[DingTalk][CardCallback] 记录点赞反馈失败: ${err?.message ?? err}`);
-            });
           } else if (actionIds.includes(dislikeActionId)) {
             const reasons = Array.isArray(params.dislike_reason)
               ? params.dislike_reason.join("、")
@@ -699,12 +703,6 @@ export async function monitorSingleAccount(
             logger.info(`[DingTalk][CardCallback] 👎 用户 ${userId} 点踩了 ${outTrackId}，原因：${reasons}${custom ? `，补充：${custom}` : ""}`);
             response.cardData.cardParamMap[likeVar] = -1;
             response.cardData.cardParamMap.submitted = "true";
-            // 将点踩反馈记录到 session
-            const dislikeReasons = Array.isArray(params.dislike_reason) ? params.dislike_reason : [];
-            const customDislikeReason = params.custom_dislike_reason ?? undefined;
-            recordFeedbackToSession({ outTrackId, like: -1, userId, dislikeReasons, customDislikeReason, logger }).catch(err => {
-              logger.warn(`[DingTalk][CardCallback] 记录点踩反馈失败: ${err?.message ?? err}`);
-            });
           } else {
             logger.info(`[DingTalk][CardCallback] 未知 actionIds=${JSON.stringify(actionIds)}，按默认处理`);
           }
@@ -737,6 +735,11 @@ export async function monitorSingleAccount(
       logger.info(
         `✅ 自定义 keepAlive: true (10 秒心跳，90 秒超时), 指数退避重连`,
       );
+
+      // 连接成功后注册事件监听器（socket 此时已存在）
+      setupPongListener();
+      setupMessageListener();
+      setupCloseListener();
 
       // 初次连接成功，向框架报告 connected: true
       onStatusChange?.({ connected: true, lastConnectedAt: Date.now() });
