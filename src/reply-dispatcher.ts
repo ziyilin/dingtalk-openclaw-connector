@@ -365,11 +365,7 @@ export function createDingtalkReplyDispatcher(params: CreateDingtalkReplyDispatc
         log.error(`[DingTalk][startStreaming] ❌ AI Card 创建失败：${error?.message || String(error)}，静默降级到普通消息模式`);
         currentCardTarget = null;
       }
-    })().finally(() => {
-      // ✅ 确保所有路径（preCreatedCard / 新建 / 异常 / asyncMode / streamingDisabled）都清空 promise，
-      // 允许后续 turn 的 startStreaming 重新创建卡片
-      cardCreationPromise = null;
-    });
+    })();
 
     cardCreationPromise = creation;
     // 在 Promise settle 后清空 gate，覆盖所有路径（含 asyncMode /
