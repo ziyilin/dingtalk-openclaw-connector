@@ -53,6 +53,7 @@ import { sendProactive, sendMessage, type AICardTarget } from "../services/messa
 import { checkCommandPolicy, type CommandPolicy } from "../policy.ts";
 import { createDingtalkReplyDispatcher } from "../reply-dispatcher.ts";
 import { normalizeSlashCommand } from "../utils/session.ts";
+import { FILE_INLINE_MAX_CHARS, FILE_PREVIEW_CHARS } from "../utils/constants.ts";
 import {
   pickEmptyReplyFallbackText,
   emptyGroupReplyLogHint,
@@ -1368,19 +1369,49 @@ async function handleDingTalkMessageInternal(
       const parseResult = await parseFileContent(localPath, fileName, log);
       
       if (parseResult.type === 'text' && parseResult.content) {
-        // 文本类文件：将内容注入到上下文（即使解析成功也给出文件路径）
-        const contentPreview = parseResult.content.length > 200 
-          ? parseResult.content.slice(0, 200) + '...' 
-          : parseResult.content;
-        
-        fileContentParts.push(
-          `📄 **${fileType}**: ${fileName}\n` +
-          `✅ 已解析文件内容（${parseResult.content.length} 字符）\n` +
-          `💾 已保存到本地: ${localPath}\n` +
-          `📝 内容预览:\n\`\`\`\n${contentPreview}\n\`\`\`\n\n` +
-          `📋 完整内容:\n${parseResult.content}`
-        );
-        log?.info?.(`文件解析成功: ${fileName}, 内容长度=${parseResult.content.length}`);
+        // 文本类文件：不把内容或预览注入上下文，只给可读取的本地文本路径，由 agent 自行用 read 工具读取。
+        // 这样无论文件多大都不会撑爆会话上下文（避免 run-failed-before-reply）。
+        const fullContent = parseResult.content;
+        const contentLength = fullContent.length;
+        // 复用外层已声明的 ext（= path.extname(fileName).toLowerCase()）
+        // .docx/.doc/.pdf 在磁盘上是二进制原文件，agent 的 read 工具无法直接读取；
+        // 需把解析出的纯文本落盘为 sidecar(.extracted.txt)，再让 agent read 该文本文件。
+        const isBinaryOriginal = ['.docx', '.doc', '.pdf'].includes(ext);
+
+        let readPath = localPath;
+        let sidecarOk = false;
+        if (isBinaryOriginal) {
+          const sidecarPath = `${localPath}.extracted.txt`;
+          try {
+            fs.writeFileSync(sidecarPath, fullContent, 'utf-8');
+            readPath = sidecarPath;
+            sidecarOk = true;
+            log?.info?.(`${ext} 解析文本已落盘 sidecar: ${sidecarPath}, 长度=${contentLength}`);
+          } catch (e: any) {
+            log?.error?.(`sidecar 写入失败: ${sidecarPath}, error=${e.message}`);
+          }
+        }
+
+        if (isBinaryOriginal && !sidecarOk) {
+          // 极端兜底：sidecar 落盘失败时内联解析文本（超长按上限截断），避免 agent 完全拿不到内容
+          const shown = contentLength > FILE_INLINE_MAX_CHARS
+            ? fullContent.slice(0, FILE_PREVIEW_CHARS) + `\n...(共 ${contentLength} 字符，已截断)`
+            : fullContent;
+          fileContentParts.push(
+            `📄 **${fileType}**: ${fileName}\n` +
+            `⚠️ 提取文本落盘失败，以下为内联内容（超长已截断）:\n${shown}\n` +
+            `💾 原始文件: ${localPath}`
+          );
+          log?.warn?.(`文本文件 sidecar 失败，已回退内联: ${fileName}, 内容长度=${contentLength}`);
+        } else {
+          fileContentParts.push(
+            `📄 **${fileType}**: ${fileName}\n` +
+            `📊 内容长度: ${contentLength} 字符${isBinaryOriginal ? `（已从 ${ext} 提取为纯文本）` : ''}\n` +
+            `💾 已保存到本地: ${localPath}\n` +
+            `👉 请用 \`read\` 工具读取该文件进行分析（文件很大时可按行范围分段读取）：${readPath}`
+          );
+          log?.info?.(`文本文件已保存，转由 agent 自行读取: ${fileName}, 内容长度=${contentLength}, readPath=${readPath}`);
+        }
       } else if (parseResult.type === 'text' && !parseResult.content) {
         // 文本类文件但解析失败
         fileContentParts.push(
@@ -1394,9 +1425,13 @@ async function handleDingTalkMessageInternal(
         // 二进制文件：只保存到磁盘
         // 特殊处理音频文件的语音识别文本
         if (fileType === '音频' && content.text && content.text !== '[语音消息]') {
+          // 语音识别文本同样设上限，避免超长转写结果内联撑爆上下文
+          const asrText = content.text.length > FILE_INLINE_MAX_CHARS
+            ? content.text.slice(0, FILE_PREVIEW_CHARS) + `\n...(语音识别结果共 ${content.text.length} 字符，已截断)`
+            : content.text;
           fileContentParts.push(
             `🎤 **${fileType}**: ${fileName}\n` +
-            `📝 语音识别: ${content.text}\n` +
+            `📝 语音识别: ${asrText}\n` +
             `💾 已保存到本地: ${localPath}\n` +
             `🔗 [点击下载](${downloadUrl})`
           );
